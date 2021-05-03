@@ -1,0 +1,660 @@
+---
+title: "DSS Manuscript"
+output: html_notebook
+---
+
+#Libraries
+```{r}
+library("phyloseq")
+library("tidyverse")
+library("qiime2R")
+library("ggpubr")
+library("RColorBrewer")
+library("data.table")
+library("ggridges")
+library(vegan)
+library(cowplot)
+library(rstatix)
+library(e1071)
+library(gridExtra)
+library(DT)
+library("ape")
+library("biomformat")
+library("dplyr")
+library(rstatix)
+library("car")
+library(ggplot2)
+library(ggpubr)
+library(rstatix)
+library(vegan)
+```
+
+#Bring in DSS that was merged in qiime, with all filtering already done. filtered out sequences that were present in sheath fluid but absent in pellet (from the ProperFiltering folder)
+```{r}
+ps <- qza_to_phyloseq("TableDSSAllPF-filt2.qza","rooted-tree.qza","taxonomy.qza")
+
+# #or if the above doesn't work:
+# tmp <- tempdir()
+# features<-read_qza('TableDSSAllPF-filt2.qza', tmp=tmp)$data
+# taxonomy<-read_qza('taxonomy.qza', tmp=tmp)$data
+# taxonomy<-parse_taxonomy(taxonomy)
+# taxonomy<-as.matrix(taxonomy)
+# tree<-read_qza('rooted-tree.qza', tmp=tmp)$data
+
+
+my_otu <- otu_table(features, taxa_are_rows = T)
+my_tree <- phy_tree(tree)
+my_taxa <- tax_table(taxonomy)
+metadata<-read_tsv("metadata-allDSS.tsv") 
+my_meta <- sample_data(metadata) 
+sample_names(my_meta) <- metadata$sampleid
+ps2 <- phyloseq(my_otu, my_tree, my_taxa, my_meta)
+tax_table(ps2)
+```
+
+
+#Removing Contaminants
+```{r}
+ps2 <- subset_samples(ps2, Physiology != "H-")
+SF <- subset_samples(ps2, Physiology == "SF")
+SF <- prune_taxa(taxa_sums(SF) > 0, SF)
+SFnames <- taxa_names(SF) #taxa that are present in sheath fluid, 271 taxa present in the sheath fluid
+DNAps2 <- subset_samples(ps2, Physiology == "PELLET") #867 taxa in unsorted, the original pellet
+DNAps2 <- prune_taxa(taxa_sums(DNAps2) < 1, DNAps2) #everything that is absent in the original pellet (taxa sum is less than 0) 187
+DNAps2names <- taxa_names(DNAps2) #everything absent in the pellet, which is 187 taxa!
+#Now I want to find the intersection between SFnames and DNAps2names (ie found in SF, but absent from DNA, as in the name DNAps2names)
+Taxa_to_filter <- intersect(SFnames, DNAps2names)  # 7 taxa
+#there are 7 taxa that are present in sheath fluid but absent from DNA  (remember i did filtering in  qiime)
+Taxa_to_keep <- setdiff(taxa_names(ps2), Taxa_to_filter)
+length(Taxa_to_keep)  
+ps2_NoSF <- prune_taxa(Taxa_to_keep, ps2) #860 taxa, getting rid of the 7
+
+ps0 <- subset_taxa(ps2_NoSF, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized")) #Now at 11772 taxa, removed 37
+ps4 <- filter_taxa(ps0, function(x) sum(x > 4) > (0.02*length(x)), TRUE) #512 taxa (from 11772! that's only 4% kept)
+Phys = c("HNA", "LNA", "PI", "H+", "H-", "PELLET")
+DSS <- subset_samples(ps4, Physiology %in% Phys) #479 taxa, 777 samples
+colnames(sample_data(DSS))
+DSS3 <- subset_samples(DSS, Experiment == "DSS3") #283 samples
+DSS4 <- subset_samples(DSS, Experiment == "4") #245 samples
+DSS2 <- subset_samples(DSS, Experiment == "DSS2-1" | Experiment == "DSS2-2"| Experiment == "DSS2") #249 sample
+```
+
+#Cleanup 
+```{r}
+DSS <- subset_samples(DSS, !is.na(Physiology))
+DSS <- subset_samples(DSS, !is.na(Day))
+DSSa <- subset_samples(DSS, Mouse != "nH")
+#DSSx <- subset_samples(DSSa, Day != "1"& Day != "2"& Day != "8"& Day != "9")
+
+DSSx <- subset_samples(DSSa, Controls != "control" | is.na(Controls) ) 
+#Glom to species level since multiple DADA2 runs are combined together
+#DSSx <- tip_glom(DSSx, h = 0.1)
+#glomming the tips to 0.1 gets it down to 108 taxa from 479, retainign 22%, genus level is 88 taxa,
+
+#Turn BS+  to BCpos 
+new_sample_data <- as(sample_data(DSSx), "data.frame") %>%
+  mutate(Physiology = ifelse(Physiology == "H+", "BCpos", Physiology)) %>%
+  mutate(Physiology = ifelse(Physiology == "H++", "BCpospos", Physiology))
+new_sample_data <- sample_data(new_sample_data)
+sample_names(new_sample_data) <- sample_names(sample_data(DSSx))
+sample_data(DSSx) <- new_sample_data
+```
+
+#Figure 5 Barplots
+```{r}
+sample_data(DSSx)$Day = as.numeric(sample_data(DSSx)$Day)
+DSSPhyl <- tax_glom(DSSx, "Phylum")
+DSSPhylRA <- transform_sample_counts(DSSPhyl, function(x) x / sum(x) )
+DSSRAPhylumNC  <- subset_samples(DSSPhylRA , !Physiology %in% Controls) 
+
+df <- DSSRAPhylumNC %>% psmelt() 
+
+df$Physiology <- factor(df$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+
+aggregate(Abundance ~ Day + Physiology + Phylum, data = df, mean) %>%
+  ggplot(aes(y = Abundance, x = Day)) +
+  geom_bar(aes(fill = Phylum), stat='identity') + ylab("Relative Abundance") + scale_y_continuous(name = "Relative Abundance", breaks = c(0,0.5,1)) +
+  facet_grid(rows = vars(Physiology)) +theme(text = element_text(size = 14)) + theme_bw() + scale_fill_brewer(palette = "Accent")
+ggsave("PhylaLevelTaxaBarplot.pdf", width = 6, height = 7)
+
+
+#Genus
+DSSRA <- transform(DSSx, "compositional")
+DSSRAGenus <- tax_glom(DSSRA, "Genus")
+
+Top10Genus <- names(sort(taxa_sums(DSSRAGenus), TRUE)[1:10])
+Top10GenusDSS <- prune_species(Top10Genus, DSSRAGenus)
+#Take what is not in top 10 and name as other
+AllGenus <- taxa_names(DSSRAGenus)
+OtherGenera <- setdiff(AllGenus, Top10Genus) #"c8d2b3167ef685d221379c95b2553a66"
+DSS_TopGenus <- merge_taxa(DSSRAGenus, OtherGenera, 1)
+DSSRAGenusNC  <- subset_samples(DSS_TopGenus , !Physiology %in% Controls) 
+#remove physiology is na
+DSSRAGenusNC <- subset_samples(DSSRAGenusNC, !is.na(Physiology))
+#remove mous is nH
+DSSRAGenusNC <- subset_samples(DSSRAGenusNC, Mouse != "nH")
+
+df <- DSSRAGenusNC %>% psmelt()
+
+df$Physiology <- factor(df$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI") )
+
+unique(df$Genus)
+
+aggregate(Abundance ~ Day + Physiology + Genus, data = df, mean) %>%
+  ggplot(aes(y = Abundance, x = Day)) +
+  geom_bar(aes(fill = Genus), stat='identity') + ylab("Relative Abundance") + 
+  scale_y_continuous(name = "Relative Abundance", breaks = c(0,0.5,1)) +
+  facet_grid(rows = vars(Physiology)) +theme(text = element_text(size = 14)) + theme_bw()
+ggsave("GenusLevelTaxaBarplot.pdf", width = 7.2, height = 7)
+```
+
+#Permanova functions
+```{r}
+#By Day
+Permanova_WU <- function(subset_phys_ps) {
+  counts = otu_table(subset_phys_ps)
+  tree = phy_tree(subset_phys_ps)
+  rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  adonis(rbiom_weighted.rlog ~ Day,
+       data = as(sample_data(subset_phys_ps), "data.frame"))
+}
+
+#By DiseaseState
+Permanova_WU_DS <- function(subset_phys_ps) {
+  counts = otu_table(subset_phys_ps)
+  tree = phy_tree(subset_phys_ps)
+  rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  adonis(rbiom_weighted.rlog ~ DiseaseState,
+       data = as(sample_data(subset_phys_ps), "data.frame"))
+}
+
+#By Physiology
+Permanova_WU_Phys <- function(subset_phys_ps) {
+  counts = otu_table(subset_phys_ps)
+  tree = phy_tree(subset_phys_ps)
+  rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  adonis(rbiom_weighted.rlog ~ Physiology,
+       data = as(sample_data(subset_phys_ps), "data.frame"))
+}
+```
+
+#Permanova of baseline
+```{r}
+DSSx.rel <- microbiome::transform(DSSx, "compositional")
+
+#get just baseline
+Baseline <- subset_samples(DSSx.rel, DiseaseState == "baseline")
+#remove rows that have NA in mouse
+Baseline <- subset_samples(Baseline, !is.na(Mouse))
+
+#ASV
+counts = otu_table(Baseline)
+tree = phy_tree(Baseline)
+metadata <- as(sample_data(Baseline), "data.frame")
+adonis(rbiom::unifrac(counts, weighted=TRUE, tree=tree) ~ Physiology*Day, data = metadata)
+
+#Phylum
+Baseline.p <- tax_glom(Baseline, "Phylum")
+counts = otu_table(Baseline.p)
+tree = phy_tree(Baseline.p)
+metadata <- as(sample_data(Baseline.p), "data.frame")
+adonis(rbiom::unifrac(counts, weighted=TRUE, tree=tree) ~ Physiology*Day, data = metadata)
+
+#Genus
+Baseline.g <- tax_glom(Baseline, "Genus")
+counts = otu_table(Baseline.g)
+tree = phy_tree(Baseline.g)
+metadata <- as(sample_data(Baseline.g), "data.frame")
+adonis(rbiom::unifrac(counts, weighted=TRUE, tree=tree) ~ Physiology*Day, data = metadata)
+```
+
+#Table 1 Permanova by disease state
+```{r}
+# are physiological groups distinct from one another (**add p value of permanova at each disease state
+
+#subset by disease state
+Baseline <- subset_samples(DSSx.rel, DiseaseState == "baseline")
+Presympt <- subset_samples(DSSx.rel, DiseaseState == "pre-symptoms")
+Symp <- subset_samples(DSSx.rel, DiseaseState == "symptoms")
+Recovery <-  subset_samples(DSSx.rel, DiseaseState == "recovery")
+W1 <- subset_samples(DSSx.rel, DiseaseState == "W1")
+W2 <- subset_samples(DSSx.rel, DiseaseState == "W2")
+
+Permanova_WU_Phys(Baseline)
+
+Permanova_WU_Phys(Presympt)
+
+Permanova_WU_Phys(Symp)
+
+Permanova_WU_Phys(Recovery)
+
+Permanova_WU_Phys(W1)
+
+Permanova_WU_Phys(W2)
+
+#Disease state as a function of physiology 
+counts = otu_table(DSSx.rel)
+tree = phy_tree(DSSx.rel)
+metadata <- as(sample_data(DSSx.rel), "data.frame")
+adonis(rbiom::unifrac(counts, weighted=TRUE, tree=tree) ~ Physiology*DiseaseState, data = metadata)
+```
+
+#Figure 3 WUF
+```{r}
+HNA <- subset_samples(DSSx.rel, Physiology == "HNA")
+LNA <- subset_samples(DSSx.rel, Physiology == "LNA")
+BCpos <- subset_samples(DSSx.rel, Physiology == "BCpos")
+PI <- subset_samples(DSSx.rel, Physiology == "PI")
+pellet <- subset_samples(DSSx.rel, Physiology == "PELLET")
+
+PCoADayWU <- function(subset_phys_ps, phys) {
+  counts = otu_table(subset_phys_ps)
+  tree = phy_tree(subset_phys_ps)
+  rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  pcoa.rlog = ordinate(subset_phys_ps, method="PCoA", distance=rbiom_weighted.rlog)
+  plot_ordination(subset_phys_ps, pcoa.rlog, "samples", color="DiseaseState", title = phys) + 
+    geom_point(size=3) + theme_bw() +  theme(text = element_text(size = 12)) + 
+    scale_color_manual(values=c("#d1ddf1", "#feefc1", "#c9c9c9", "#d98689", "grey58", "grey45")) 
+}
+
+pHNA <- PCoADayWU(HNA, "HNA")
+pLNA <- PCoADayWU(LNA, "LNA")
+pPI <- PCoADayWU(PI, "PI")
+pBCpos <- PCoADayWU(BCpos, "BONCAT+")
+pPellet <- PCoADayWU(pellet, "Whole community")
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+
+legend <- get_legend(pHNA)
+
+plot_grid(legend, pPellet + theme(legend.position = "none"), pBCpos + theme(legend.position = "none"), pHNA + theme(legend.position = "none"), pLNA + theme(legend.position = "none"), pPI + theme(legend.position = "none"), nrow = 2)
+ggsave("WUFPCoRrelAbunNoTipGlom.pdf" , height = 6.8, width = 9)
+
+Permanova_WU_DS(HNA)
+Permanova_WU_DS(LNA)
+Permanova_WU_DS(PI)
+Permanova_WU_DS(BCpos)
+Permanova_WU_DS(pellet)
+```
+
+
+#boxplot function
+```{r}
+library("reshape2")
+
+plotDistances = function(p, m , s , d , title) {
+
+  # calc distances
+  #wu = phyloseq::distance(p, m) #if doing bray curtis
+  tree = phy_tree(p)
+  counts = otu_table(p)
+  wu = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  wu.m = melt(as.matrix(wu))
+  
+    # remove self-comparisons
+  wu.m = wu.m %>%
+    filter(as.character(Var1) != as.character(Var2)) %>%
+    mutate(Var1 = as.character(Var1)) %>% mutate(Var2 = as.character(Var2))
+
+  
+  # get sample data (S4 error OK and expected)
+ sd = sample_data(p)[,c(s, d)]
+ 
+  # combined distances with sample data
+  colnames(sd) = c("Var1", "Type1")
+  wu.sd = left_join(wu.m, sd, by = "Var1")
+  
+  
+  colnames(sd) = c("Var2", "Type2")
+  wu.sd = left_join(wu.sd, sd, by = "Var2")
+  
+  #only include comparisons within a symptom group
+  wu.sd <- filter(wu.sd, Type1 == "baseline")
+  #make them in the correct order
+  wu.sd$Type2 <- factor(wu.sd$Type2, levels=c("baseline", "pre-symptoms", "symptoms", "recovery"))
+ 
+  # #do the stats
+  res.kruskal <- wu.sd %>% kruskal_test(value ~ Type2)
+  pwc <-  wu.sd %>% dunn_test(value ~ Type2, p.adjust.method = "BH") %>%  filter(group1 == "baseline")
+  pwc <- pwc %>% add_xy_position(x = "Type2")
+  print(wu.sd)
+  
+  # plot
+  ggplot(wu.sd, aes(x = Type2, y = value)) +
+    theme_bw() +
+    geom_boxplot(aes(fill = Type2), outlier.alpha = 0.5) +
+    scale_fill_manual(values=c("#d1ddf1", "#feefc1", "#d98689", "#c9c9c9")) +
+    theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(legend.position = "none") +
+    ggtitle(title) +
+    xlab("") +
+    ylab(paste0(m, "")) +
+    #stat_compare_means(method = "kruskal.test", label.x = 1.2, label.y = 0.15) +
+    stat_pvalue_manual(pwc, hide.ns = TRUE, step.increase  = 0.09, size = 6) 
+}
+```
+#Figure 4a
+```{r}
+DSSx.rel3 <- subset_samples(DSSx.rel, DiseaseState != "W1")
+DSSx.rel3 <- subset_samples(DSSx.rel3, DiseaseState != "W2")
+
+HNA <- subset_samples(DSSx.rel3, Physiology == "HNA" )
+LNA <- subset_samples(DSSx.rel3, Physiology == "LNA")
+BCpos <- subset_samples(DSSx.rel3, Physiology == "BCpos")
+PI <- subset_samples(DSSx.rel3, Physiology == "PI")
+Pellet <- subset_samples(DSSx.rel3, Physiology == "PELLET")
+p.HNA.BC <- plotDistances(HNA, "Weighted UniFrac", "sampleid", "DiseaseState", "HNA")
+p.LNA.BC <- plotDistances(LNA, "Weighted UniFrac", "sampleid", "DiseaseState", "LNA")
+p.PI.BC <- plotDistances(PI, "Weighted UniFrac", "sampleid", "DiseaseState", "PI")
+p.BCpos.BC <- plotDistances(BCpos, "Weighted UniFrac", "sampleid", "DiseaseState", "BONCAT+")
+p.Pellet.BC <- plotDistances(Pellet, "Weighted UniFrac", "sampleid", "DiseaseState", "Whole community")
+
+plot_grid(p.Pellet.BC, p.BCpos.BC,  p.HNA.BC, p.LNA.BC, p.PI.BC, nrow = 2)
+ggsave("WUFdistancesboxplotRA-without week12-notipglom.pdf", height = 8, width = 8)
+```
+
+#Fig 4b Presymptoms to baseline
+```{r}
+#plotPairedDistances = function(p, m , s , d , i, phys, e, title) {
+  # p = phyloseq object
+  # m = distance method
+  # s = how you call your sampleids
+  # d = disease state column title (how you want to group)
+  # i = column title of your indidividauls 
+  # phys = column title for physiology 
+  # column title to differnetiate between experiments 
+  
+#wu = phyloseq::distance(p, m) 
+DSSx.rel3 <- subset_samples(DSSx.rel3, Physiology != "BCneg")
+  tree = phy_tree(DSSx.rel3)
+  counts = otu_table(DSSx.rel3)
+  wu = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  wu.m = melt(as.matrix(wu))
+  
+    # remove self-comparisons
+  wu.m = wu.m %>%
+    filter(as.character(Var1) != as.character(Var2)) %>%
+    mutate(Var1 = as.character(Var1)) %>% mutate(Var2 = as.character(Var2))
+  
+  # get sample data (S4 error OK and expected)
+ sd = sample_data(DSSx.rel3)[,c("sampleid" , "DiseaseState" , "Mouse", "Physiology", "Experiment")]
+ 
+  # combined distances with sample data
+  colnames(sd) = c("Var1", "DiseaseState" , "Mouse", "Physiology", "Experiment")
+  wu.sd = left_join(wu.m, sd, by = "Var1")
+  
+  
+  colnames(sd) = c("Var2", "DiseaseState" , "Mouse", "Physiology", "Experiment")
+  wu.sd = left_join(wu.sd, sd, by = "Var2")
+  
+  #only include comparisons that are baseline to presymptoms
+  wu.sd <- filter(wu.sd, DiseaseState.x == "baseline") # I lose DSS2 because don't have baseline for it
+  wu.sd <- filter(wu.sd, DiseaseState.y == "pre-symptoms")
+  
+  #make them in the correct order
+  wu.sd$Physiology.x <- factor(wu.sd$Physiology.x, levels=c("PELLET","BCpos", "HNA", "LNA", "PI" ))
+
+# #do the stats
+  res.kruskal <- wu.sd %>% kruskal_test(value ~ Physiology.x)
+  pwc <-  wu.sd %>% 
+   dunn_test(value ~ Physiology.x, p.adjust.method = "BH") %>% filter(group1 == "PELLET" | group2 == "PELLET")
+  pwc <- pwc %>% add_xy_position(x = "Physiology")
+   
+  # plot
+  ggplot(wu.sd, aes(x = Physiology.x, y = value)) +
+    theme_bw() +
+    geom_boxplot(fill = "#feefc1" ) +
+    #scale_color_identity() +
+    theme(axis.text.x=element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    ggtitle("Presymptoms to baseline") +
+    xlab("") +
+    ylab("Weighted UniFrac") +
+    #stat_compare_means(method = "kruskal.test", label.x = 1.0, label.y = 1.2) +
+    stat_pvalue_manual(pwc, hide.ns = TRUE, size = 6, step.increase = 0.09) +
+    theme(text = element_text(size = 14))  
+
+
+#plotPairedDistances(DSSx.rel3, "bray" , "sampleid" , "DiseaseState" , "Mouse", "Physiology", "Experiment", "BC baseline to presymptoms")
+ggsave("baselinepresymptoms BC RA.pdf", width = 4.7, height = 5)
+```
+
+#Figure 6a Corncob
+```{r}
+library(corncob)
+library(magrittr)
+
+#Anything that is not weighted unifrac, I should tip glom! Also keep this as raw counts
+DSSxtg <- tip_glom(DSSx, h = 0.1) #glomming up high, before was doing 0.1
+
+HNA <- subset_samples(DSSxtg, Physiology == "HNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+LNA <- subset_samples(DSSxtg, Physiology == "LNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+PI <- subset_samples(DSSxtg, Physiology == "PI") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+BCpos <- subset_samples(DSSxtg, Physiology == "BCpos") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+WC <- subset_samples(DSSxtg, Physiology == "PELLET") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+
+#controls for the effect of disease state on dispersion
+cc <- function(ps, title){
+  da <- differentialTest(
+  formula = ~ DiseaseState ,
+  phi.formula = ~ DiseaseState , 
+  formula_null = ~ 1, 
+  phi.formula_null = ~ DiseaseState , 
+  test = "Wald", boot = FALSE, 
+  data = ps,
+  fdr_cutoff = 0.05)
+
+which(is.na(da$p)) %>% names
+pdf(file=title, width = 10)
+plot(da)
+}
+
+cc(HNA, "HNA1cc.pdf")
+cc(LNA, "LNA1cc.pdf")
+cc(PI, "PI1cc.pdf")
+cc(BCpos, "BCpos1cc.pdf")
+#cc(BCneg, "BCnegcc.pdf")
+cc(WC, "WC1cc.pdf")
+
+#sometiems the function breaks and returns an empty pdf, rerun the broken ones here 
+daWC <- differentialTest(
+  formula = ~ DiseaseState ,
+  phi.formula = ~ DiseaseState , 
+  formula_null = ~ 1, 
+  phi.formula_null = ~ DiseaseState , 
+  test = "Wald", boot = FALSE, 
+  data = HNA, #change the ps object here
+  fdr_cutoff = 0.05)
+
+daWC$significant_taxa
+
+which(is.na(daWC$p)) %>% names
+
+cex <- 2
+par(cex.lab=cex, cex.axis=cex, cex.main=cex)
+pdf(file="ccHNA.pdf", width = 10, pointsize = 100)
+plot(daWC)
+```
+
+#Relative Abundance of specific taxa over time, taxa chosen based off peramnova or corncob
+```{r}
+#Akkermansia
+Akkermansia.ps <- subset_taxa(DSSx.rel3, Genus == "Akkermansia") #the only taxa in the phylum verrucomicrobia
+Akkermansia <- psmelt(Akkermansia.ps) 
+#groupby disease state and physiology
+Akkermansia %>% group_by(DiseaseState,Physiology) %>% summarize(mean(Abundance))
+
+#ggplot(Akkermansia, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology)) + theme_bw() + #xlim(c(-3,10)) + ylab("Relative Abundance") + ggtitle("Akkermansia muciniphila")
+#ggsave("Amuciiphila.pdf", width = 6.8, height = 5.2)
+
+RA.plot <- function(df, title, pdftitle) {
+  df$Physiology <- factor(df$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+  ggplot(df, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology)) +
+  theme_bw() + xlim(c(-3,10)) + ylab("Relative Abundance") + ggtitle(title)
+ggsave(pdftitle, width = 6.8, height = 5.2)
+}
+
+RA.plot(Akkermansia, "Akkermansia", "Akkermansia.pdf")
+
+Eubacterium.ps <- subset_taxa(DSSx.rel3, Genus == "[Eubacterium] coprostanoligenes group")
+Eubacterium <- psmelt(Eubacterium.ps)
+RA.plot(Eubacterium, "Eubacterium", "Eubacterium.pdf")
+
+Bifidobacterium.ps <- subset_taxa(DSSx.rel3, Genus == "Bifidobacterium")
+Bifido <- psmelt(Bifidobacterium.ps)
+RA.plot(Bifido, "Bifidobacterium", "Bifidobacterium.pdf")
+
+Marvinbryantia.ps <- prune_taxa("a1fe1f45720a7ea7649cbaff45fa34e3", DSSx.rel3) # 6 taxa in this genera, doing the sepcific asv
+Marvinbryantia <- psmelt(Marvinbryantia.ps) 
+RA.plot(Marvinbryantia, "Clostridia, Marvinbryantia", "Marvinbryantia.pdf") #doesn't look like much, let's find the specific otu
+
+
+
+DSSxtg.RA <- transform(DSSxtg, "compositional")
+
+
+tax_table(WC)[51]
+attr(WC, "original_names")[51]
+"b1d42839235884b6341cc6faed8133c8"
+
+prune_taxa(attr(WC, "original_names")[51], DSSxtg.RA) %>% psmelt() %>% RA.plot(., "Eubacterium", "Eubacterium.pdf")
+
+subset_taxa(DSSxtg.RA, Family == "Peptococcaceae") %>%  tax_glom(., "Class") %>% psmelt() %>% RA.plot(., "Clostridia, Peptococcaceae", "Peptococcaceae.pdf")
+
+subset_taxa(DSSxtg.RA, Class== "Alphaproteobacteria") %>%  tax_glom(., "Class") %>% psmelt() %>% RA.plot(., "Alphaproteobacteria", "Alphaproteobacteria.pdf")
+
+subset_taxa(DSSxtg.RA, Family== "Erysipelotrichaceae") %>% tax_glom(., "Family") %>% psmelt() %>% RA.plot(., "Firmicutes, Erysipelotrichaceae ", "Erysipelotrichaceae .pdf")
+
+subset_taxa(DSSxtg.RA, Genus== "Bifidobacterium") %>% psmelt() %>% RA.plot(., "Bifidobacterium", "Bifidobacterium2.pdf")
+
+subset_taxa(DSSxtg.RA, Family== "Family XIII") %>% psmelt() %>% RA.plot(., "Clostridiales, Family XIII ", "Family XIII.pdf")
+
+subset_taxa(DSSxtg.RA, Genus== "Pseudomonas") %>% psmelt() %>% RA.plot(., "Pseudomonas", "Pseudomonas.pdf")
+
+subset_taxa(DSSxtg.RA, Genus== "Lactobacillus") %>% psmelt() %>% RA.plot(., "Lactobacillus", "Lactobacillus.pdf")
+
+subset_taxa(DSSxtg.RA, Family== "Ruminococcaceae") %>% tax_glom(., "Family") %>% psmelt() %>% RA.plot(., "Clostridiales, Ruminococcaceae", "Ruminococcaceae.pdf")
+```
+
+#Figure 6b RA plots Colour-coding by signficiance 
+```{r}
+Am <- subset_taxa(DSSxtg.RA, Genus == "Akkermansia") %>% psmelt()
+
+Am$Physiology <- factor(Am$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+
+ggplot(Am, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology, linetype = Physiology)) + theme_bw() + xlim(c(-3,10)) + ylab("Relative Abundance") + ggtitle("Akkermansia muciniphila") + scale_linetype_manual(values=c("solid", "solid","solid","solid","dashed")) + theme(text = element_text(size = 16))  
+
+ggsave("Amuciniphila.pdf", width = 6.8, height = 5.2)
+
+#Erisy
+Ery <- subset_taxa(DSSxtg.RA, Family== "Erysipelotrichaceae") %>% tax_glom(., "Family") %>% psmelt()
+Ery$Physiology <- factor(Ery$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+ggplot(Ery, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology, linetype = Physiology)) + theme_bw() + xlim(c(-3,10)) + ylab("Relative Abundance") + ggtitle("Erysipelotrichaceae") + scale_linetype_manual(values=c("solid", "dashed","dashed","dashed","dashed")) + theme(text = element_text(size = 16))  
+ggsave("Erysipelotrichaceae.pdf", width = 6.8, height = 5.2)
+
+#bifido
+bifido <- subset_taxa(DSSxtg.RA, Genus== "Bifidobacterium") %>% psmelt()
+bifido$Physiology <- factor(bifido$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+ggplot(bifido, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology, linetype = Physiology)) + theme_bw() + xlim(c(-3,10)) + ylim(c(0,0.3)) + ylab("Relative Abundance") + ggtitle("Bifidobacteria") + scale_linetype_manual(values=c("dashed", "solid","dashed","dashed","dashed")) + theme(text = element_text(size = 16))  
+ggsave("Bifidobacteria.pdf", width = 6.8, height = 5.2)
+
+#FamXIII
+FamXIII <- subset_taxa(DSSxtg.RA, Family== "Family XIII") %>% tax_glom(., "Family") %>% psmelt()
+FamXIII$Physiology <- factor(FamXIII$Physiology, levels = c("PELLET", "BCpos", "HNA", "LNA", "PI")  )
+ggplot(FamXIII, aes(x = Day, y = Abundance)) + geom_point(alpha = 0.5, aes(color = Physiology)) + geom_smooth(method = "loess", aes(color = Physiology, linetype = Physiology)) + theme_bw() + xlim(c(-3,10)) + ylim(c(0,0.03)) + ylab("Relative Abundance") + ggtitle("Clostridiales Family XIII") + scale_linetype_manual(values=c("dashed", "solid","dashed","solid","dashed")) + theme(text = element_text(size = 16))  
+ggsave("Family XIII.pdf", width = 6.8, height = 5.2)
+```
+
+#Firmicutes
+```{r}
+#Since Firmicutes are much more diverse, they are also changing in abdunace in many different ways. let's look at this closer
+
+Firmicutes <- subset_taxa(DSSx, Phylum == "Firmicutes")
+                          
+FHNA <- subset_samples(Firmicutes, Physiology == "HNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FLNA <- subset_samples(Firmicutes, Physiology == "LNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FPI <- subset_samples(Firmicutes, Physiology == "PI") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FBCpos <- subset_samples(Firmicutes, Physiology == "BCpos") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FWC <- subset_samples(Firmicutes, Physiology == "PELLET") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+
+cc(FHNA, "FHNAcc.pdf")
+cc(FLNA, "FLNAcc.pdf")
+cc(FPI, "FPIcc.pdf")
+cc(FBCpos, "FBCposcc.pdf")
+cc(FWC, "FWCcc.pdf")  
+
+Firm.Family <- tax_glom(Firmicutes, "Family")
+FFHNA <- subset_samples(Firm.Family, Physiology == "HNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FFLNA <- subset_samples(Firm.Family, Physiology == "LNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FFPI <- subset_samples(Firm.Family, Physiology == "PI") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FFBCpos <- subset_samples(Firm.Family, Physiology == "BCpos") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FFWC <- subset_samples(Firm.Family, Physiology == "PELLET") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+
+cc(FFHNA, "FFHNAcc.pdf")
+cc(FFLNA, "FFLNAcc.pdf")
+cc(FFPI, "FFPIcc.pdf")
+cc(FFBCpos, "FFBCposcc.pdf")
+cc(FFWC, "FFWCcc.pdf")  
+```
+
+#corncob phylum level
+```{r}
+Phylum <- tax_glom(DSSx, "Phylum")
+
+PHNA <- subset_samples(Phylum, Physiology == "HNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+PLNA <- subset_samples(Phylum, Physiology == "LNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+PPI <- subset_samples(Phylum, Physiology == "PI") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+PBCpos <- subset_samples(Phylum, Physiology == "BCpos") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+PWC <- subset_samples(Phylum, Physiology == "PELLET") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+
+cc(PHNA, "PHNAcc.pdf")
+cc(PLNA, "PLNAcc.pdf")
+cc(PPI, "FPIcc.pdf")
+cc(PBCpos, "FBCposcc.pdf")
+cc(PWC, "FWCcc.pdf")         
+
+PhylumDS <- subset_samples(Phylum, DiseaseState == "baseline" | DiseaseState == "pre-symptoms") %>% clean_taxa_names()
+daWC <- differentialTest(
+  formula = ~ DiseaseState * Physiology ,
+  phi.formula = ~ DiseaseState , 
+  formula_null = ~ 1, 
+  phi.formula_null = ~ DiseaseState , 
+  test = "Wald", boot = FALSE, 
+  data = PhylumDS,
+  fdr_cutoff = 0.05)
+
+plot(daWC, col = "Taxa")
+heatmap(daWC)
+daWC$significant_models
+corncob::plot.bbdml(daWC)
+corncob::plot.diff
+
+plot.differentialTest(daWC)
+
+#How are firmciutes behaving overall?
+corncob_da <- bbdml(formula = OTU4 ~ DiseaseState,
+phi.formula = ~ DiseaseState,
+data = PHNA)
+plot(corncob_da, color = "DiseaseState")
+summary(corncob_da)
+
+#family level
+Family <- tax_glom(DSSx, "Family")
+
+FamHNA <- subset_samples(Family, Physiology == "HNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FamLNA <- subset_samples(Family, Physiology == "LNA") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FamPI <- subset_samples(Family, Physiology == "PI") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FamBCpos <- subset_samples(Family, Physiology == "BCpos") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+FamWC <- subset_samples(Family, Physiology == "PELLET") %>% subset_samples(., DiseaseState == "baseline" | DiseaseState == "pre-symptoms")  %>% clean_taxa_names()
+
+cc(FamHNA, "FamHNAcc.pdf")
+cc(FamLNA, "FamLNAcc.pdf")
+cc(FamPI, "FamPIcc.pdf")
+cc(FamBCpos, "FamBCposcc.pdf")
+cc(FamWC, "FamWCcc.pdf") 
+```
+
